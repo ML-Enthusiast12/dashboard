@@ -5,10 +5,10 @@
 
 ## 🏗️ Project Structure
 
-── Dockerfile
-── requirements.txt
-── dashboard.py   # Actions by Week Super Chart & Team Performance Dashboard
-── README.md
+1)  Dockerfile
+2) requirements.txt
+3) dashboard.py   # Actions by Week Super Chart & Team Performance Dashboard
+4) README.md
 
 
 
