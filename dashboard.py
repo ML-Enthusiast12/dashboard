@@ -1,22 +1,27 @@
 
+
 import streamlit as st
-import pandas as pd
-import plotly.graph_objects as go
-import plotly.express as px
-from datetime import datetime, timedelta
 import requests
-from dateutil import parser
 import json
-import os
+import pandas as pd
+import plotly.express as px
+import plotly.graph_objects as go
+import matplotlib.pyplot as plt
+from datetime import datetime, timedelta
+from dateutil import parser
 
 # Streamlit page configuration
 st.set_page_config(page_title="Combined Monday.com Dashboard", layout="wide")
 
-# Monday.com API setup
+# Monday.com API configuration
 API_TOKEN = "eyJhbGciOiJIUzI1NiJ9.eyJ0aWQiOjUzNjcxMTM2NCwiYWFpIjoxMSwidWlkIjo3ODEyNjAzOSwiaWFkIjoiMjAyNS0wNy0wOVQwNjoxMjoxMi4wMDBaIiwicGVyIjoibWU6d3JpdGUiLCJhY3RpZCI6Mjg1MTUzNDksInJnbiI6InVzZTEifQ.7xlG-veqLRWWL5RqmmJ5Ve4dxVlhnv0Z43CGktBnmp8"
 API_URL = "https://api.monday.com/v2"
+headers = {
+    "Authorization": API_TOKEN,
+    "Content-Type": "application/json"
+}
 
-# Board IDs and column mappings for Outstanding Tasks Dashboard
+# Board IDs and column mappings
 BOARD_IDS = {"project1": "9148781915", "Project2": "9567843297"}
 COLUMN_MAPPINGS = {
     "9148781915": {
@@ -41,16 +46,325 @@ DUE_DATE_COLUMN_ID = "date_mkqyf70p"
 CREATE_DATE_COLUMN_ID = "date_mkqyvac7"
 DONE_STATUSES = ["Done"]
 
-# Headers for API requests
-headers = {
-    "Authorization": API_TOKEN,
-    "Content-Type": "application/json"
+# Global status column IDs
+status_column_ids = {
+    "project1": "color_mkqyyxxc",
+    "Project2": "color_mksrmg1x"
+}
+
+# Common color mapping
+color_map = {
+    "Done": "green",
+    "Stuck": "grey",
+    "Overdue": "red",
+    "Outstanding": "orange"
 }
 
 # Get current week for Outstanding Tasks Dashboard
 today = datetime.now()
 start_of_week = today - timedelta(days=today.weekday())
 end_of_week = start_of_week + timedelta(days=6)
+
+# --- Project-Wise and Employee-Wise Dashboard Functions ---
+def fetch_project_data(board_ids):
+    """Fetch data for project-wise chart"""
+    query = {
+        "query": """
+        query {
+          boards(ids: [%s]) {
+            name
+            items_page(limit: 500) {
+              items {
+                name
+                column_values {
+                  id
+                  text
+                  value
+                }
+              }
+            }
+          }
+        }
+        """ % ",".join(str(board_id) for board_id in board_ids)
+    }
+    
+    try:
+        response = requests.post(API_URL, json=query, headers=headers, timeout=10)
+        response.raise_for_status()
+        result = response.json()
+        
+        if "errors" in result:
+            st.error(f"API Error: {result['errors']}")
+            return None
+        return result
+    except requests.exceptions.RequestException as e:
+        st.error(f"API request failed: {str(e)}")
+        return None
+    except json.JSONDecodeError as e:
+        st.error(f"Failed to decode API response: {str(e)}")
+        return None
+
+def fetch_employee_data():
+    """Fetch data for employee-wise chart"""
+    query = """
+    query {
+        boards(ids: 9148781915) {
+            id
+            name
+            items_page(limit: 100) {
+                items {
+                    id
+                    name
+                    column_values {
+                        id
+                        value
+                        text
+                        type
+                    }
+                    group {
+                        id
+                        title
+                    }
+                }
+            }
+            columns {
+                id
+                title
+                type
+                settings_str
+            }
+        }
+        users {
+            id
+            name
+            email
+        }
+    }
+    """
+    
+    try:
+        response = requests.post(API_URL, json={"query": query}, headers=headers)
+        if response.status_code != 200:
+            st.error(f"Failed to fetch data from Monday.com: {response.text}")
+            return None, None
+        data = response.json()
+        if "errors" in data:
+            st.error(f"GraphQL Error: {data['errors']}")
+            return None, None
+        return data["data"]["boards"], data["data"]["users"]
+    except Exception as e:
+        st.error(f"Error fetching employee data: {str(e)}")
+        return None, None
+
+def process_project_data(monday_data):
+    """Process data for project-wise chart"""
+    status_counts = {}
+    
+    for board in monday_data["data"]["boards"]:
+        project_name = board["name"]
+        
+        if project_name in ["project1", "Project2"]:
+            status_counts[project_name] = {"Done": 0, "Stuck": 0, "Overdue": 0, "Outstanding": 0}
+            
+            for item in board["items_page"]["items"]:
+                item_processed = False
+                for column in item["column_values"]:
+                    if column["id"] == status_column_ids.get(project_name):
+                        status_label = None
+                        
+                        if column["value"]:
+                            try:
+                                status_data = json.loads(column["value"])
+                                status_label = status_data.get("label", "")
+                            except (json.JSONDecodeError, KeyError):
+                                pass
+                        
+                        if not status_label and column["text"]:
+                            status_label = column["text"]
+                        
+                        if not status_label:
+                            status_label = "Outstanding"
+                        
+                        status_lower = status_label.lower()
+                        if status_lower in ["done", "completed", "complete"]:
+                            status_counts[project_name]["Done"] += 1
+                        elif status_lower in ["working on it", "in progress", "stuck"]:
+                            status_counts[project_name]["Stuck"] += 1
+                        elif status_lower in ["overdue", "late", "delayed"]:
+                            status_counts[project_name]["Overdue"] += 1
+                        else:
+                            status_counts[project_name]["Outstanding"] += 1
+                            
+                        item_processed = True
+                        break
+                
+                if not item_processed:
+                    status_counts[project_name]["Outstanding"] += 1
+    
+    return status_counts
+
+def process_employee_data(boards, users):
+    """Process data for employee-wise chart"""
+    tasks_data = []
+    user_dict = {user["id"]: user["name"] for user in users}
+    
+    for board in boards:
+        column_map = {column["id"]: column["title"] for column in board["columns"]}
+        
+        person_col_id = None
+        status_col_id = None
+        
+        for col_id, col_title in column_map.items():
+            if col_title.lower() == "person":
+                person_col_id = col_id
+            elif col_title.lower() == "status":
+                status_col_id = col_id
+        
+        if not person_col_id or not status_col_id:
+            st.error("Could not find 'Person' or 'Status' columns in the board.")
+            return pd.DataFrame()
+
+        for item in board["items_page"]["items"]:
+            person_name = None
+            status = "Backlog"
+            
+            for column in item["column_values"]:
+                if column["id"] == person_col_id:
+                    if column.get("text") and column["text"].strip():
+                        person_name = column["text"].strip()
+                    elif column.get("value"):
+                        try:
+                            person_data = json.loads(column["value"])
+                            if "personsAndTeams" in person_data:
+                                persons = person_data["personsAndTeams"]
+                                if persons and len(persons) > 0:
+                                    person_id = persons[0].get("id")
+                                    if person_id:
+                                        person_name = user_dict.get(str(person_id))
+                            elif "ids" in person_data:
+                                ids = person_data["ids"]
+                                if ids and len(ids) > 0:
+                                    person_id = ids[0]
+                                    person_name = user_dict.get(str(person_id))
+                        except (json.JSONDecodeError, KeyError, IndexError):
+                            person_name = None
+                
+                if column["id"] == status_col_id:
+                    if column.get("text") and column["text"].strip():
+                        status = column["text"].strip()
+                    elif column.get("value"):
+                        try:
+                            status_data = json.loads(column["value"])
+                            status = status_data.get("label", "Backlog")
+                        except (json.JSONDecodeError, KeyError):
+                            status = "Backlog"
+                    
+                    status = status.title() if status else "Backlog"
+            
+            if person_name:
+                tasks_data.append({
+                    "Person": person_name, 
+                    "Status": status,
+                    "Task": item["name"]
+                })
+
+    return pd.DataFrame(tasks_data)
+
+def create_project_chart(status_counts):
+    """Create project-wise chart"""
+    if not status_counts:
+        st.warning("No data found for project1 or Project2. Check board names or column IDs.")
+        return
+    
+    df = pd.DataFrame(status_counts).T.reset_index()
+    df = df.melt(id_vars="index", var_name="Status", value_name="Count")
+    df = df.rename(columns={"index": "Project"})
+    df = df[df["Count"] > 0]
+
+    fig = px.bar(df, x="Project", y="Count", color="Status",
+                 title="Task Status Chart Project-Wise",
+                 barmode='stack',
+                 color_discrete_map=color_map)
+    
+    fig.update_layout(
+        xaxis_title="Project",
+        yaxis_title="Number of Tasks",
+        showlegend=True,
+        height=400
+    )
+
+    st.plotly_chart(fig, use_container_width=True)
+
+def create_employee_chart(df, filter_option):
+    """Create employee-wise chart"""
+    if df.empty:
+        st.warning("No tasks found with assigned persons.")
+        return
+    
+    with st.expander("View Status Details"):
+        status_counts = df["Status"].value_counts()
+        st.write("**Status counts:**")
+        for status, count in status_counts.items():
+            color = color_map.get(status, "gray")
+            st.write(f"  {status}: {count} tasks (color: {color})")
+        
+        stuck_tasks = df[df["Status"] == "Stuck"]
+        if not stuck_tasks.empty:
+            st.write("\n**Stuck Tasks - Require Attention:**")
+            for _, task in stuck_tasks.iterrows():
+                st.write(f"  • {task['Person']}: {task['Task']}")
+
+    if filter_option == "Non-Completed Tasks":
+        df = df[df["Status"] != "Done"]
+
+    all_persons = sorted(df["Person"].unique().tolist())
+    task_counts = df.groupby(['Person', 'Status']).size().unstack(fill_value=0)
+    task_counts = task_counts.reindex(all_persons, fill_value=0)
+    
+    expected_statuses = ["Stuck", "Done", "Overdue", "Outstanding"]
+    for status in expected_statuses:
+        if status not in task_counts.columns:
+            task_counts[status] = 0
+
+    if filter_option == "All Tasks":
+        statuses_to_show = ["Done", "Outstanding", "Overdue", "Stuck"]
+    else:
+        statuses_to_show = ["Outstanding", "Overdue", "Stuck"]
+    
+    statuses_to_show = [s for s in statuses_to_show if s in task_counts.columns and task_counts[s].sum() > 0]
+
+    fig, ax = plt.subplots(figsize=(12, 6))
+    
+    bottom_values = [0] * len(task_counts.index)
+    
+    for status in statuses_to_show:
+        if status in task_counts.columns:
+            values = task_counts[status].values
+            color = color_map.get(status, "gray")
+            
+            bars = ax.barh(range(len(task_counts.index)), values, 
+                          left=bottom_values, color=color, label=status, 
+                          edgecolor='white', linewidth=0.5)
+            
+            for i, (bar, value) in enumerate(zip(bars, values)):
+                if value > 0:
+                    text_x = bottom_values[i] + value / 2
+                    text_y = i
+                    ax.text(text_x, text_y, str(value), 
+                           ha='center', va='center', 
+                           fontweight='bold', fontsize=10, color='white')
+            
+            bottom_values = [b + v for b, v in zip(bottom_values, values)]
+
+    ax.set_yticks(range(len(task_counts.index)))
+    ax.set_yticklabels(task_counts.index)
+    ax.set_xlabel("Number of Tasks", fontsize=12)
+    ax.set_title("Task Distribution by Person", fontsize=14, fontweight='bold')
+    ax.legend(title="Status", loc='upper right')
+    ax.grid(axis='x', alpha=0.3)
+    
+    plt.tight_layout()
+    st.pyplot(fig)
 
 # --- Actions By Week Dashboard Functions ---
 @st.cache_data
@@ -646,7 +960,7 @@ def outstanding_tasks_dashboard():
                 st.write(f"  - {key}: {value}")
     st.divider()
 
-# --- Simple Outstanding Tasks Dashboard Functions (from provided code) ---
+# --- Simple Outstanding Tasks Dashboard Functions ---
 def fetch_monday_data_simple():
     BOARD_ID = "9148781915"
     query = """
@@ -695,7 +1009,7 @@ def process_data_simple(data):
     return pd.DataFrame(records)
 
 def simple_outstanding_tasks_dashboard():
-    st.header("Outstanding Tasks - All Charts ")
+    st.header("Outstanding Tasks - All Charts")
     data = fetch_monday_data_simple()
     if data is None:
         return
@@ -724,7 +1038,7 @@ def simple_outstanding_tasks_dashboard():
         title="Outstanding Tasks by Person",
         color_discrete_map=status_colors
     )
-    st.subheader("Outstanding Tasks Chart- Due This Week Chart")
+    st.subheader("Outstanding Tasks Chart")
     st.plotly_chart(fig)
     st.subheader("Task Counts Table")
     st.write(pivot_df)
@@ -733,13 +1047,90 @@ def simple_outstanding_tasks_dashboard():
 # --- Main Dashboard ---
 def main():
     st.title("Dashboard")
-    st.markdown("This dashboard displays multiple views of Monday.com data, including Actions By Week, Team Performance, Outstanding Tasks, and Simple Outstanding Tasks, all on a single screen.")
+    st.markdown("This dashboard integrates multiple views of Monday.com data, including Project-Wise Task Status, Employee Task Distribution, Actions By Week, Team Performance, Outstanding Tasks, and Simple Outstanding Tasks, all displayed on a single screen.")
+    st.markdown("---")
 
-    # Display all dashboards sequentially
+    # Layout for Project-Wise and Employee-Wise Charts
+    col1, col2 = st.columns(2)
+    
+    with col1:
+        st.header("🏗️ Project-Wise Task Status")
+        board_ids = [9148781915, 9567843297]
+        monday_data = fetch_project_data(board_ids)
+        
+        if monday_data:
+            status_counts = process_project_data(monday_data)
+            create_project_chart(status_counts)
+    
+    with col2:
+        st.header("👥 Employee Task Distribution")
+        filter_option = st.selectbox("Filter Tasks", ["All Tasks", "Non-Completed Tasks"], key="employee_filter")
+        boards, users = fetch_employee_data()
+        
+        if boards and users:
+            employee_df = process_employee_data(boards, users)
+            create_employee_chart(employee_df, filter_option)
+
+    # Actions By Week Dashboard
     actions_by_week_dashboard()
+
+    # Team Performance Dashboard
     team_performance_dashboard()
+
+    # Outstanding Tasks Dashboard
     outstanding_tasks_dashboard()
+
+    # Simple Outstanding Tasks Dashboard
     simple_outstanding_tasks_dashboard()
+
+    # Summary Statistics Section
+    st.markdown("---")
+    st.header("📈 Summary Statistics")
+    
+    if 'monday_data' in locals() and 'employee_df' in locals():
+        summary_col1, summary_col2, summary_col3 = st.columns(3)
+        
+        with summary_col1:
+            st.subheader("Project Summary")
+            if monday_data:
+                total_tasks = 0
+                for project, counts in status_counts.items():
+                    project_total = sum(counts.values())
+                    total_tasks += project_total
+                    st.write(f"**{project}**: {project_total} tasks")
+                st.write(f"**Total across projects**: {total_tasks} tasks")
+        
+        with summary_col2:
+            st.subheader("Employee Summary")
+            if not employee_df.empty:
+                total_by_person = employee_df.groupby("Person").size().sort_values(ascending=False)
+                st.write("**Tasks by Person:**")
+                for person, count in total_by_person.head(5).items():
+                    st.write(f"  {person}: {count} tasks")
+        
+        with summary_col3:
+            st.subheader("Status Overview")
+            if not employee_df.empty:
+                total_by_status = employee_df.groupby("Status").size().sort_values(ascending=False)
+                st.write("**Tasks by Status:**")
+                for status, count in total_by_status.items():
+                    color = color_map.get(status, "gray")
+                    st.write(f"  {status}: {count} tasks")
+
+    # Footer
+    st.markdown("---")
+    st.markdown("*Dashboard last updated: " + datetime.now().strftime("%Y-%m-%d %H:%M:%S") + "*")
 
 if __name__ == "__main__":
     main()
+
+
+
+
+
+
+
+
+
+
+
